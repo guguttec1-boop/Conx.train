@@ -160,7 +160,7 @@ async function telegram(method, options = {}) {
 
 
 // ======================================================
-// SAVE TELEGRAM VIDEO
+// SAVE TELEGRAM VIDEO (UPDATED)
 // ======================================================
 
 async function saveTelegramVideo(msg) {
@@ -217,8 +217,11 @@ async function saveTelegramVideo(msg) {
     telegramFile.file_path;
 
 
-  // IMPORTANT:
-  // We do NOT save the bot token inside Firebase.
+  // ==============================================
+  //  🚀 NEW: Build full Telegram file URL
+  // ==============================================
+  const fullVideoUrl =
+    `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
 
 
   const data = {
@@ -256,7 +259,14 @@ async function saveTelegramVideo(msg) {
     file_size:
       video.file_size || null,
 
+    // ==============================================
+    //  🚀 NEW: Store the direct URL
+    // ==============================================
     video_url:
+      fullVideoUrl,
+
+    // Optional fallback relative path – you can keep or remove
+    _legacy_path:
       `/video/${encodeURIComponent(postId)}`,
 
     created_at:
@@ -283,8 +293,8 @@ async function saveTelegramVideo(msg) {
 
 
   console.log(
-    "Video saved successfully:",
-    postId
+    "Video saved successfully with direct URL:",
+    fullVideoUrl
   );
 
 
@@ -573,7 +583,7 @@ app.post(
 
 
 // ======================================================
-// VIDEO STREAMING
+// VIDEO STREAMING (FALLBACK – not needed if using direct URL)
 // ======================================================
 
 app.get(
@@ -617,6 +627,12 @@ app.get(
 
       const post =
         snapshot.val();
+
+
+      // If the post already has a full URL, redirect to it.
+      if (post.video_url && post.video_url.startsWith('http')) {
+        return res.redirect(post.video_url);
+      }
 
 
       if (
