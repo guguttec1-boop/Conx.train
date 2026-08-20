@@ -160,7 +160,74 @@ async function telegram(method, options = {}) {
 
 
 // ======================================================
-// SAVE TELEGRAM VIDEO
+// SAVE VIDEO TO FIREBASE (shared helper)
+// ======================================================
+
+async function saveVideoToFirebase(videoData, messageId, channelId, caption) {
+
+  const postId =
+    `telegram_${channelId}_${messageId}`
+      .replace(
+        /[^a-zA-Z0-9_-]/g,
+        "_"
+      );
+
+  // Check if already exists
+  const existing = await db.ref(`posts/${postId}`).once('value');
+  if (existing.exists()) {
+    console.log("Post already exists, skipping duplicate:", postId);
+    return existing.val();
+  }
+
+  // Get file path from Telegram
+  const file = await telegram(`getFile?file_id=${encodeURIComponent(videoData.file_id)}`);
+
+  const fullUrl =
+    `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
+
+  const data = {
+
+    post_id: postId,
+
+    type: "video",
+
+    caption: caption || "",
+
+    telegram_file_id: videoData.file_id,
+
+    telegram_file_path: file.file_path,
+
+    telegram_message_id: messageId,
+
+    telegram_channel_id: String(channelId),
+
+    width: videoData.width || null,
+
+    height: videoData.height || null,
+
+    duration: videoData.duration || null,
+
+    file_size: videoData.file_size || null,
+
+    video_url: fullUrl,
+
+    created_at: Date.now(),
+
+    source: "website" // or "telegram"
+
+  };
+
+  await db.ref(`posts/${postId}`).set(data);
+
+  console.log("Video saved to Firebase:", postId);
+
+  return data;
+
+}
+
+
+// ======================================================
+// SAVE TELEGRAM VIDEO (webhook – uses same helper)
 // ======================================================
 
 async function saveTelegramVideo(msg) {
@@ -175,120 +242,12 @@ async function saveTelegramVideo(msg) {
 
   }
 
+  const video = msg.video;
+  const messageId = msg.message_id;
+  const channelId = msg.chat?.id || CHANNEL_ID;
+  const caption = msg.caption || "";
 
-  const video =
-    msg.video;
-
-  const messageId =
-    msg.message_id;
-
-  const channelId =
-    msg.chat?.id || CHANNEL_ID;
-
-  const caption =
-    msg.caption || "";
-
-
-  // Unique Firebase ID
-  const postId =
-    `telegram_${channelId}_${messageId}`
-      .replace(
-        /[^a-zA-Z0-9_-]/g,
-        "_"
-      );
-
-
-  const fileId =
-    video.file_id;
-
-
-  console.log(
-    "Getting Telegram file information..."
-  );
-
-
-  const telegramFile =
-    await telegram(
-      `getFile?file_id=${encodeURIComponent(fileId)}`
-    );
-
-
-  const filePath =
-    telegramFile.file_path;
-
-
-  // IMPORTANT:
-  // We do NOT save the bot token inside Firebase.
-
-
-  const data = {
-
-    post_id:
-      postId,
-
-    type:
-      "video",
-
-    caption:
-      caption,
-
-    telegram_file_id:
-      fileId,
-
-    telegram_file_path:
-      filePath,
-
-    telegram_message_id:
-      messageId,
-
-    telegram_channel_id:
-      String(channelId),
-
-    width:
-      video.width || null,
-
-    height:
-      video.height || null,
-
-    duration:
-      video.duration || null,
-
-    file_size:
-      video.file_size || null,
-
-    video_url:
-      `/video/${encodeURIComponent(postId)}`,
-
-    created_at:
-      (msg.date ||
-        Math.floor(
-          Date.now() / 1000
-        )) * 1000,
-
-    source:
-      "telegram"
-
-  };
-
-
-  console.log(
-    "Saving video to Firebase:",
-    postId
-  );
-
-
-  await db
-    .ref(`posts/${postId}`)
-    .set(data);
-
-
-  console.log(
-    "Video saved successfully:",
-    postId
-  );
-
-
-  return data;
+  return await saveVideoToFirebase(video, messageId, channelId, caption);
 
 }
 
@@ -406,7 +365,7 @@ app.post(
 
 
 // ======================================================
-// WEBSITE VIDEO UPLOAD
+// WEBSITE VIDEO UPLOAD (UPDATED)
 // ======================================================
 
 app.post(
@@ -515,23 +474,34 @@ app.post(
       );
 
 
+      const messageId =
+        data.result.message_id;
+
+      const videoData =
+        data.result.video;
+
       console.log(
         "Message ID:",
-        data.result.message_id
+        messageId
       );
 
 
-      /*
-        IMPORTANT:
+      // ----------------------------------------------
+      // SAVE TO FIREBASE DIRECTLY
+      // ----------------------------------------------
 
-        We DO NOT save the post to Firebase here.
+      const saved =
+        await saveVideoToFirebase(
+          videoData,
+          messageId,
+          CHANNEL_ID,
+          caption
+        );
 
-        Telegram will send a channel_post webhook.
 
-        The webhook calls saveTelegramVideo().
-
-        This prevents duplicate Firebase posts.
-      */
+      console.log(
+        "Video saved to Firebase via upload."
+      );
 
 
       res.json({
@@ -540,10 +510,13 @@ app.post(
           true,
 
         message:
-          "Video sent to Telegram successfully",
+          "Video uploaded and saved to Firebase",
 
         telegram_message_id:
-          data.result.message_id
+          messageId,
+
+        firebase_post_id:
+          saved.post_id
 
       });
 
@@ -573,7 +546,7 @@ app.post(
 
 
 // ======================================================
-// VIDEO STREAMING
+// VIDEO STREAMING (FALLBACK – redirects to direct URL)
 // ======================================================
 
 app.get(
@@ -617,6 +590,12 @@ app.get(
 
       const post =
         snapshot.val();
+
+
+      // If the post already has a full URL, redirect to it.
+      if (post.video_url && post.video_url.startsWith('http')) {
+        return res.redirect(post.video_url);
+      }
 
 
       if (
