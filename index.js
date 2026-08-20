@@ -1,16 +1,22 @@
 const express = require('express');
+const cors = require('cors');                 // 👈 Add CORS support
 const admin = require('firebase-admin');
 const multer = require('multer');
 const FormData = require('form-data');
 const app = express();
-app.use(express.json());
 
 // ============================================================
-// CONFIGURATION (all from environment variables)
+// CORS – allows your frontend to call this API
+// ============================================================
+app.use(cors());                               // allow all origins (or restrict with { origin: 'https://your-domain.com' })
+app.use(express.json({ limit: '10mb' }));
+
+// ============================================================
+// CONFIGURATION (environment variables)
 // ============================================================
 const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const CHAT_ID = process.env.TELEGRAM_CHANNEL_ID; // negative for channel
+const CHAT_ID = process.env.TELEGRAM_CHANNEL_ID;      // negative for channel
 const DATABASE_URL = process.env.FIREBASE_DATABASE_URL || 'https://droplet-trading-default-rtdb.firebaseio.com/';
 
 if (!BOT_TOKEN || !CHAT_ID) {
@@ -45,7 +51,7 @@ const db = admin.database();
 const upload = multer({ storage: multer.memoryStorage() });
 
 // ============================================================
-// TELEGRAM API HELPER
+// TELEGRAM API HELPERS
 // ============================================================
 async function sendVideoToTelegram(buffer, filename, caption) {
   const form = new FormData();
@@ -66,9 +72,6 @@ async function sendVideoToTelegram(buffer, filename, caption) {
   return data.result; // contains message_id, chat, video file_id, etc.
 }
 
-// ============================================================
-// GET TELEGRAM FILE URL FROM file_id
-// ============================================================
 async function getTelegramFileUrl(fileId) {
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`;
   const response = await fetch(url);
@@ -143,7 +146,7 @@ app.post('/api/upload-video', verifyFirebaseToken, upload.single('video'), async
 // (Optional) Webhook endpoint – if you still want to read channel posts
 // ============================================================
 app.post('/webhook', async (req, res) => {
-  // You can keep this empty if not needed, or add your existing logic
+  // You can keep this empty if not needed
   res.sendStatus(200);
 });
 
