@@ -1,822 +1,210 @@
-const express = require("express");
-const cors = require("cors");
-const multer = require("multer");
-const admin = require("firebase-admin");
+// ============================================================
+// 📦 index.js – ConneX Backend Server
+// ============================================================
+// This server handles video uploads, stores post metadata in
+// Firebase Realtime Database, and interacts with Telegram to
+// obtain a video URL. It also returns the post ID so the frontend
+// can associate the post with the uploading user's uid.
+// ============================================================
 
-const app = express();
+const express = require('express');
+const multer = require('multer');
+const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
+const axios = require('axios');
+const FormData = require('form-data');
 
+// 🔥 Firebase Admin SDK (for server-side database operations)
+const admin = require('firebase-admin');
+
+// ============================================================
+// 1. CONFIGURATION – set environment variables or hardcode
+// ============================================================
 const PORT = process.env.PORT || 3000;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8625518587:AAEBqZfKb_liszvYXAZebRy8WT5vtn7jCIY';
+const TELEGRAM_CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID || '-1004394988713';
 
-// ======================================================
-// ENVIRONMENT VARIABLES
-// ======================================================
+// Firebase Database URL (from your config)
+const FIREBASE_DATABASE_URL = 'https://droplet-trading-default-rtdb.firebaseio.com/';
+const FIREBASE_SERVICE_ACCOUNT = process.env.FIREBASE_SERVICE_ACCOUNT
+  ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+  : {
+      projectId: 'droplet-trading',
+      privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL || 'firebase-adminsdk@droplet-trading.iam.gserviceaccount.com',
+    };
 
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
-
-const DATABASE_URL = process.env.FIREBASE_DATABASE_URL;
-const PROJECT_ID = process.env.FIREBASE_PROJECT_ID;
-const CLIENT_EMAIL = process.env.FIREBASE_CLIENT_EMAIL;
-const PRIVATE_KEY = process.env.FIREBASE_PRIVATE_KEY;
-
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
-
-
-// ======================================================
-// BASIC CHECK
-// ======================================================
-
-console.log("=================================");
-console.log("Droplet Video Platform starting...");
-console.log("=================================");
-
-console.log(
-  "Telegram token:",
-  BOT_TOKEN ? "OK" : "MISSING"
-);
-
-console.log(
-  "Telegram channel:",
-  CHANNEL_ID ? "OK" : "MISSING"
-);
-
-console.log(
-  "Firebase URL:",
-  DATABASE_URL ? "OK" : "MISSING"
-);
-
-console.log(
-  "Firebase project:",
-  PROJECT_ID ? "OK" : "MISSING"
-);
-
-console.log(
-  "Firebase email:",
-  CLIENT_EMAIL ? "OK" : "MISSING"
-);
-
-console.log(
-  "Firebase private key:",
-  PRIVATE_KEY ? "OK" : "MISSING"
-);
-
-console.log(
-  "Webhook secret:",
-  WEBHOOK_SECRET ? "OK" : "MISSING"
-);
-
-
-// ======================================================
-// FIREBASE INITIALIZATION
-// ======================================================
-
-admin.initializeApp({
-
-  credential: admin.credential.cert({
-
-    projectId: PROJECT_ID,
-
-    clientEmail: CLIENT_EMAIL,
-
-    privateKey: PRIVATE_KEY
-      ? PRIVATE_KEY.replace(/\\n/g, "\n")
-      : undefined
-
-  }),
-
-  databaseURL: DATABASE_URL
-
-});
-
+// ============================================================
+// 2. INITIALIZE FIREBASE ADMIN
+// ============================================================
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert(FIREBASE_SERVICE_ACCOUNT),
+    databaseURL: FIREBASE_DATABASE_URL,
+  });
+}
 const db = admin.database();
 
+// ============================================================
+// 3. EXPRESS APP SETUP
+// ============================================================
+const app = express();
+app.use(cors({ origin: '*' }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// ======================================================
-// EXPRESS
-// ======================================================
-
-app.use(cors());
-
-app.use(
-  express.json({
-    limit: "10mb"
-  })
-);
-
-app.use(
-  express.urlencoded({
-    extended: true
-  })
-);
-
-
-// ======================================================
-// MULTER
-// ======================================================
-
+// Configure multer for in‑memory file storage
 const upload = multer({
-
   storage: multer.memoryStorage(),
-
-  limits: {
-
-    fileSize:
-      50 * 1024 * 1024
-
-  }
-
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('video/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only video files are allowed'), false);
+    }
+  },
 });
 
+// ============================================================
+// 4. TELEGRAM HELPERS
+// ============================================================
 
-// ======================================================
-// TELEGRAM API
-// ======================================================
+/**
+ * Upload a video buffer to Telegram and return the file path/URL.
+ */
+async function uploadToTelegram(videoBuffer, caption = '') {
+  const form = new FormData();
+  form.append('chat_id', TELEGRAM_CHANNEL_ID);
+  form.append('video', videoBuffer, {
+    filename: `video_${Date.now()}.mp4`,
+    contentType: 'video/mp4',
+  });
+  if (caption) form.append('caption', caption);
 
-async function telegram(method, options = {}) {
-
-  const url =
-    `https://api.telegram.org/bot${BOT_TOKEN}/${method}`;
-
-  const response =
-    await fetch(
-      url,
-      options
+  try {
+    const response = await axios.post(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideo`,
+      form,
+      { headers: form.getHeaders() }
     );
 
-  const data =
-    await response.json();
+    const result = response.data;
+    if (!result.ok) {
+      throw new Error(`Telegram error: ${result.description}`);
+    }
 
-  if (!data.ok) {
-
-    throw new Error(
-      `Telegram API error: ${JSON.stringify(data)}`
+    const videoFileId = result.result.video.file_id;
+    // Get file path
+    const fileInfo = await axios.get(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${videoFileId}`
     );
+    const filePath = fileInfo.data.result.file_path;
+    const videoUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`;
 
+    // Return video URL and file ID
+    return {
+      video_url: videoUrl,
+      file_id: videoFileId,
+      file_path: filePath,
+      message_id: result.result.message_id,
+    };
+  } catch (error) {
+    console.error('Telegram upload error:', error);
+    throw new Error('Failed to upload video to Telegram: ' + error.message);
   }
-
-  return data.result;
-
 }
 
-
-// ======================================================
-// SAVE VIDEO TO FIREBASE (shared helper)
-// ======================================================
-
-async function saveVideoToFirebase(videoData, messageId, channelId, caption) {
-
-  const postId =
-    `telegram_${channelId}_${messageId}`
-      .replace(
-        /[^a-zA-Z0-9_-]/g,
-        "_"
-      );
-
-  // Check if already exists
-  const existing = await db.ref(`posts/${postId}`).once('value');
-  if (existing.exists()) {
-    console.log("Post already exists, skipping duplicate:", postId);
-    return existing.val();
-  }
-
-  // Get file path from Telegram
-  const file = await telegram(`getFile?file_id=${encodeURIComponent(videoData.file_id)}`);
-
-  const fullUrl =
-    `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
-
-  const data = {
-
-    post_id: postId,
-
-    type: "video",
-
-    caption: caption || "",
-
-    telegram_file_id: videoData.file_id,
-
-    telegram_file_path: file.file_path,
-
-    telegram_message_id: messageId,
-
-    telegram_channel_id: String(channelId),
-
-    width: videoData.width || null,
-
-    height: videoData.height || null,
-
-    duration: videoData.duration || null,
-
-    file_size: videoData.file_size || null,
-
-    video_url: fullUrl,
-
+/**
+ * Store post metadata in Firebase Realtime Database under /posts.
+ * The uid is stored so the frontend can display the correct author.
+ */
+async function storePostInFirebase(postData) {
+  const postsRef = db.ref('posts');
+  const newPostRef = postsRef.push();
+  await newPostRef.set({
+    ...postData,
     created_at: Date.now(),
-
-    source: "website" // or "telegram"
-
-  };
-
-  await db.ref(`posts/${postId}`).set(data);
-
-  console.log("Video saved to Firebase:", postId);
-
-  return data;
-
+    likes: 0,
+    views: 0,
+    comments: 0,
+  });
+  return newPostRef.key; // return the auto‑generated post ID
 }
 
+// ============================================================
+// 5. ROUTES
+// ============================================================
 
-// ======================================================
-// SAVE TELEGRAM VIDEO (webhook – uses same helper)
-// ======================================================
+// Health check
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', message: 'ConneX backend is running' });
+});
 
-async function saveTelegramVideo(msg) {
+/**
+ * POST /api/upload – upload a video, store in Telegram,
+ * save post metadata in Firebase with uid, and return the post ID.
+ */
+app.post('/api/upload', upload.single('video'), async (req, res) => {
+  try {
+    // 1. Extract fields
+    const { caption = '', hashtags = '', uid = null } = req.body;
+    const videoFile = req.file;
 
-  if (!msg || !msg.video) {
-
-    console.log(
-      "Message does not contain a video."
-    );
-
-    return null;
-
-  }
-
-  const video = msg.video;
-  const messageId = msg.message_id;
-  const channelId = msg.chat?.id || CHANNEL_ID;
-  const caption = msg.caption || "";
-
-  return await saveVideoToFirebase(video, messageId, channelId, caption);
-
-}
-
-
-// ======================================================
-// TELEGRAM WEBHOOK
-// ======================================================
-
-app.post(
-  "/telegram/webhook",
-  async (req, res) => {
-
-    try {
-
-      // ----------------------------------------------
-      // Verify Telegram secret
-      // ----------------------------------------------
-
-      const secret =
-        req.headers[
-          "x-telegram-bot-api-secret-token"
-        ];
-
-
-      if (
-        WEBHOOK_SECRET &&
-        secret !== WEBHOOK_SECRET
-      ) {
-
-        console.log(
-          "Webhook rejected: invalid secret"
-        );
-
-        return res.sendStatus(403);
-
-      }
-
-
-      const update =
-        req.body;
-
-
-      console.log(
-        "================================="
-      );
-
-      console.log(
-        "Telegram webhook received"
-      );
-
-      console.log(
-        JSON.stringify(
-          update,
-          null,
-          2
-        )
-      );
-
-
-      // ----------------------------------------------
-      // CHANNEL POST
-      // ----------------------------------------------
-
-      if (
-        update.channel_post
-      ) {
-
-        const msg =
-          update.channel_post;
-
-
-        // ------------------------------------------
-        // VIDEO
-        // ------------------------------------------
-
-        if (
-          msg.video
-        ) {
-
-          await saveTelegramVideo(
-            msg
-          );
-
-        } else {
-
-          console.log(
-            "Channel post is not a video."
-          );
-
-        }
-
-      }
-
-
-      res.sendStatus(200);
-
-
-    } catch (error) {
-
-      console.error(
-        "Webhook error:",
-        error
-      );
-
-
-      // Always acknowledge Telegram
-      // so it does not repeatedly retry.
-
-      res.sendStatus(200);
-
+    if (!videoFile) {
+      return res.status(400).json({ success: false, error: 'No video file provided' });
     }
 
-  }
-);
-
-
-// ======================================================
-// WEBSITE VIDEO UPLOAD (UPDATED)
-// ======================================================
-
-app.post(
-  "/api/upload",
-  upload.single("video"),
-  async (req, res) => {
-
-    try {
-
-      if (!req.file) {
-
-        return res.status(400).json({
-
-          success:
-            false,
-
-          error:
-            "No video uploaded"
-
-        });
-
-      }
-
-
-      const caption =
-        req.body.caption || "";
-
-
-      console.log(
-        "Website video upload received."
-      );
-
-
-      // ----------------------------------------------
-      // SEND VIDEO TO TELEGRAM
-      // ----------------------------------------------
-
-      const formData =
-        new FormData();
-
-
-      const blob =
-        new Blob(
-          [
-            req.file.buffer
-          ],
-          {
-            type:
-              req.file.mimetype ||
-              "video/mp4"
-          }
-        );
-
-
-      formData.append(
-        "chat_id",
-        CHANNEL_ID
-      );
-
-
-      formData.append(
-        "video",
-        blob,
-        req.file.originalname
-      );
-
-
-      if (caption) {
-
-        formData.append(
-          "caption",
-          caption
-        );
-
-      }
-
-
-      const response =
-        await fetch(
-          `https://api.telegram.org/bot${BOT_TOKEN}/sendVideo`,
-          {
-            method:
-              "POST",
-
-            body:
-              formData
-          }
-        );
-
-
-      const data =
-        await response.json();
-
-
-      if (!data.ok) {
-
-        throw new Error(
-          `Telegram upload failed: ${JSON.stringify(data)}`
-        );
-
-      }
-
-
-      console.log(
-        "Video sent to Telegram."
-      );
-
-
-      const messageId =
-        data.result.message_id;
-
-      const videoData =
-        data.result.video;
-
-      console.log(
-        "Message ID:",
-        messageId
-      );
-
-
-      // ----------------------------------------------
-      // SAVE TO FIREBASE DIRECTLY
-      // ----------------------------------------------
-
-      const saved =
-        await saveVideoToFirebase(
-          videoData,
-          messageId,
-          CHANNEL_ID,
-          caption
-        );
-
-
-      console.log(
-        "Video saved to Firebase via upload."
-      );
-
-
-      res.json({
-
-        success:
-          true,
-
-        message:
-          "Video uploaded and saved to Firebase",
-
-        telegram_message_id:
-          messageId,
-
-        firebase_post_id:
-          saved.post_id
-
-      });
-
-
-    } catch (error) {
-
-      console.error(
-        "Upload error:",
-        error
-      );
-
-
-      res.status(500).json({
-
-        success:
-          false,
-
-        error:
-          error.message
-
-      });
-
+    // 2. Validate uid – if missing, we cannot associate the post with a user
+    if (!uid) {
+      // You can choose to reject or allow anonymous; we'll reject for consistency
+      return res.status(400).json({ success: false, error: 'User ID (uid) is required' });
     }
 
+    // 3. Upload to Telegram
+    const telegramResult = await uploadToTelegram(videoFile.buffer, caption);
+
+    // 4. Build post object (store only uid, no authorName/authorAvatar)
+    const postData = {
+      uid: uid, // 👈 critical – links to the user's profile
+      type: 'video',
+      caption: caption,
+      hashtags: hashtags || '',
+      video_url: telegramResult.video_url,
+      telegram_file_id: telegramResult.file_id,
+      telegram_file_path: telegramResult.file_path,
+      telegram_message_id: telegramResult.message_id,
+      // Do NOT store authorName or authorAvatar – they are looked up via profile
+    };
+
+    // 5. Save to Firebase and get post ID
+    const postId = await storePostInFirebase(postData);
+
+    // 6. Return success with post ID
+    res.json({
+      success: true,
+      post_id: postId,
+      video_url: telegramResult.video_url,
+      message: 'Video uploaded and post created.',
+    });
+  } catch (error) {
+    console.error('Upload error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Internal server error',
+    });
   }
-);
-
-
-// ======================================================
-// VIDEO STREAMING (FALLBACK – redirects to direct URL)
-// ======================================================
-
-app.get(
-  "/video/:postId",
-  async (req, res) => {
-
-    try {
-
-      const postId =
-        req.params.postId;
-
-
-      console.log(
-        "Video requested:",
-        postId
-      );
-
-
-      // ----------------------------------------------
-      // Get Firebase post
-      // ----------------------------------------------
-
-      const snapshot =
-        await db
-          .ref(
-            `posts/${postId}`
-          )
-          .once("value");
-
-
-      if (!snapshot.exists()) {
-
-        return res
-          .status(404)
-          .send(
-            "Video not found"
-          );
-
-      }
-
-
-      const post =
-        snapshot.val();
-
-
-      // If the post already has a full URL, redirect to it.
-      if (post.video_url && post.video_url.startsWith('http')) {
-        return res.redirect(post.video_url);
-      }
-
-
-      if (
-        !post.telegram_file_id
-      ) {
-
-        return res
-          .status(404)
-          .send(
-            "Telegram file ID not found"
-          );
-
-      }
-
-
-      // ----------------------------------------------
-      // Get current Telegram file path
-      // ----------------------------------------------
-
-      const file =
-        await telegram(
-          `getFile?file_id=${encodeURIComponent(
-            post.telegram_file_id
-          )}`
-        );
-
-
-      const telegramUrl =
-        `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
-
-
-      console.log(
-        "Fetching video from Telegram..."
-      );
-
-
-      // ----------------------------------------------
-      // Fetch video
-      // ----------------------------------------------
-
-      const response =
-        await fetch(
-          telegramUrl
-        );
-
-
-      if (!response.ok) {
-
-        throw new Error(
-          `Telegram file request failed: ${response.status}`
-        );
-
-      }
-
-
-      // ----------------------------------------------
-      // Headers
-      // ----------------------------------------------
-
-      res.setHeader(
-        "Content-Type",
-        response.headers.get(
-          "content-type"
-        ) || "video/mp4"
-      );
-
-
-      const contentLength =
-        response.headers.get(
-          "content-length"
-        );
-
-
-      if (contentLength) {
-
-        res.setHeader(
-          "Content-Length",
-          contentLength
-        );
-
-      }
-
-
-      res.setHeader(
-        "Accept-Ranges",
-        "bytes"
-      );
-
-
-      // ----------------------------------------------
-      // Send video
-      // ----------------------------------------------
-
-      const buffer =
-        await response.arrayBuffer();
-
-
-      res.send(
-        Buffer.from(buffer)
-      );
-
-
-    } catch (error) {
-
-      console.error(
-        "Video streaming error:",
-        error
-      );
-
-
-      res
-        .status(500)
-        .send(
-          "Unable to load video"
-        );
-
-    }
-
-  }
-);
-
-
-// ======================================================
-// GET ALL POSTS
-// ======================================================
-
-app.get(
-  "/api/posts",
-  async (req, res) => {
-
-    try {
-
-      const snapshot =
-        await db
-          .ref("posts")
-          .orderByChild(
-            "created_at"
-          )
-          .once("value");
-
-
-      const posts = [];
-
-
-      snapshot.forEach(
-        child => {
-
-          posts.push({
-
-            id:
-              child.key,
-
-            ...child.val()
-
-          });
-
-        }
-      );
-
-
-      // Newest first
-
-      posts.reverse();
-
-
-      res.json(
-        posts
-      );
-
-
-    } catch (error) {
-
-      console.error(
-        "Posts error:",
-        error
-      );
-
-
-      res.status(500).json({
-
-        success:
-          false,
-
-        error:
-          error.message
-
-      });
-
-    }
-
-  }
-);
-
-
-// ======================================================
-// HEALTH CHECK
-// ======================================================
-
-app.get(
-  "/",
-  (req, res) => {
-
-    res.send(
-      "Droplet Video Platform is running."
-    );
-
-  }
-);
-
-
-// ======================================================
-// START
-// ======================================================
-
-app.listen(
-  PORT,
-  () => {
-
-    console.log(
-      `Server running on port ${PORT}`
-    );
-
-  }
-);
+});
+
+// Catch-all for undefined routes
+app.use((req, res) => {
+  res.status(404).json({ error: 'Route not found' });
+});
+
+// ============================================================
+// 6. START THE SERVER
+// ============================================================
+app.listen(PORT, () => {
+  console.log(`🚀 ConneX backend running on port ${PORT}`);
+});
