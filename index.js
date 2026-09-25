@@ -1,10 +1,9 @@
 // ============================================================
-// 📦 index.js – ConneX Backend Server
+// 📦 index.js – ConneX Backend Server (v2)
 // ============================================================
-// Handles video uploads → Telegram channel storage, and writes
-// post metadata into usersdata/{uid}/posts/{postId}.
-// Also refreshes Telegram file URLs every 30 minutes because
-// those URLs expire after ~1 hour.
+// Accepts VIDEO and IMAGE uploads → Telegram channel storage.
+// Writes post metadata into usersdata/{uid}/posts/{postId}.
+// Refreshes Telegram file URLs every 30 minutes.
 // ============================================================
 
 const express = require('express');
@@ -34,15 +33,11 @@ const FIREBASE_SERVICE_ACCOUNT = process.env.FIREBASE_SERVICE_ACCOUNT
       clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
     };
 
-// How often to refresh Telegram URLs (minutes). Default 30.
 const REFRESH_INTERVAL_MINUTES = Number(process.env.REFRESH_INTERVAL_MINUTES) || 30;
-
-// Optional: shared secret protecting the /api/cron/refresh endpoint.
-// Leave unset during dev; set it in production.
 const CRON_SECRET = process.env.CRON_SECRET || '';
 
 // ============================================================
-// 2. VALIDATE ENV VARS (fail fast with a clear message)
+// 2. VALIDATE ENV VARS
 // ============================================================
 const missing = [];
 if (!TELEGRAM_BOT_TOKEN) missing.push('TELEGRAM_BOT_TOKEN');
@@ -69,16 +64,24 @@ const db = admin.database();
 // 4. EXPRESS APP SETUP
 // ============================================================
 const app = express();
-app.use(cors({ origin: '*' }));
+
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-cron-secret'],
+}));
+
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
+// *** CHANGE 1: accept both images and videos ***
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 }, // Telegram bot API limit
+  limits: { fileSize: 50 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    if (file.mimetype.startsWith('video/')) cb(null, true);
-    else cb(new Error('Only video files are allowed'), false);
+    const ok = file.mimetype.startsWith('video/') || file.mimetype.startsWith('image/');
+    if (ok) cb(null, true);
+    else cb(new Error('Only video or image files are allowed'), false);
   },
 });
 
@@ -86,45 +89,56 @@ const upload = multer({
 // 5. TELEGRAM HELPERS
 // ============================================================
 
-async function uploadToTelegram(videoBuffer, caption = '') {
+// *** CHANGE 2: route images to sendPhoto, videos to sendVideo ***
+async function uploadToTelegram(buffer, caption, isImage, originalName) {
   const form = new FormData();
   form.append('chat_id', TELEGRAM_CHANNEL_ID);
-  form.append('video', videoBuffer, {
-    filename: `video_${Date.now()}.mp4`,
-    contentType: 'video/mp4',
-  });
+
+  if (isImage) {
+    form.append('photo', buffer, {
+      filename: originalName || `image_${Date.now()}.jpg`,
+      contentType: 'image/jpeg',
+    });
+  } else {
+    form.append('video', buffer, {
+      filename: originalName || `video_${Date.now()}.mp4`,
+      contentType: 'video/mp4',
+    });
+  }
+
   if (caption) form.append('caption', caption);
 
+  const endpoint = isImage ? 'sendPhoto' : 'sendVideo';
+
   const response = await axios.post(
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideo`,
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${endpoint}`,
     form,
     { headers: form.getHeaders(), maxBodyLength: Infinity, maxContentLength: Infinity }
   );
 
   const result = response.data;
-  if (!result.ok) {
-    throw new Error(`Telegram error: ${result.description}`);
-  }
+  if (!result.ok) throw new Error(`Telegram error: ${result.description}`);
 
-  const videoFileId = result.result.video.file_id;
+  // sendPhoto → array of sizes; sendVideo → single object
+  const fileObj = isImage
+    ? result.result.photo[result.result.photo.length - 1]
+    : result.result.video;
+
+  const fileId = fileObj.file_id;
   const fileInfo = await axios.get(
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${videoFileId}`
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`
   );
   const filePath = fileInfo.data.result.file_path;
-  const videoUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`;
+  const publicUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`;
 
   return {
-    video_url: videoUrl,
-    file_id: videoFileId,
+    video_url: publicUrl,
+    file_id: fileId,
     file_path: filePath,
     message_id: result.result.message_id,
   };
 }
 
-/**
- * Refresh a single Telegram file ID → returns { video_url, file_path }
- * or null if the file is no longer retrievable.
- */
 async function refreshTelegramFileUrl(fileId) {
   try {
     const fileInfo = await axios.get(
@@ -142,9 +156,8 @@ async function refreshTelegramFileUrl(fileId) {
 }
 
 // ============================================================
-// 6. POST STORAGE — usersdata/{uid}/posts/{postId}
+// 6. POST STORAGE
 // ============================================================
-
 async function storePostInFirebase(uid, postData) {
   const postsRef = db.ref(`usersdata/${uid}/posts`);
   const newPostRef = postsRef.push();
@@ -163,20 +176,17 @@ async function storePostInFirebase(uid, postData) {
 }
 
 // ============================================================
-// 7. TELEGRAM URL REFRESH (the 30-minute job)
+// 7. TELEGRAM URL REFRESH
 // ============================================================
-
 async function refreshAllTelegramUrls() {
   const started = Date.now();
-  console.log('🔄 Refreshing Telegram URLs for all posts…');
+  console.log('🔄 Refreshing Telegram URLs…');
 
   const usersSnap = await db.ref('usersdata').get();
   const users = usersSnap.val() || {};
 
   const updates = {};
-  let scanned = 0;
-  let refreshed = 0;
-  let failed = 0;
+  let scanned = 0, refreshed = 0, failed = 0;
 
   for (const uid of Object.keys(users)) {
     const posts = (users[uid] && users[uid].posts) || {};
@@ -186,10 +196,7 @@ async function refreshAllTelegramUrls() {
 
       scanned++;
       const fresh = await refreshTelegramFileUrl(post.telegram_file_id);
-      if (!fresh) {
-        failed++;
-        continue;
-      }
+      if (!fresh) { failed++; continue; }
 
       updates[`usersdata/${uid}/posts/${postId}/video_url`] = fresh.video_url;
       updates[`usersdata/${uid}/posts/${postId}/telegram_file_path`] = fresh.file_path;
@@ -198,18 +205,13 @@ async function refreshAllTelegramUrls() {
     }
   }
 
-  if (Object.keys(updates).length) {
-    await db.ref().update(updates);
-  }
+  if (Object.keys(updates).length) await db.ref().update(updates);
 
   const ms = Date.now() - started;
   console.log(`✅ Refresh done in ${ms}ms — scanned: ${scanned}, refreshed: ${refreshed}, failed: ${failed}`);
   return { scanned, refreshed, failed, ms };
 }
 
-/**
- * Refresh a single post's URL by path.
- */
 async function refreshPostUrl(uid, postId) {
   const snap = await db.ref(`usersdata/${uid}/posts/${postId}`).get();
   const post = snap.val();
@@ -230,41 +232,49 @@ async function refreshPostUrl(uid, postId) {
 // ============================================================
 // 8. ROUTES
 // ============================================================
-
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     message: 'ConneX backend is running',
+    version: 'v2',
+    accepts: ['video', 'image'],
     refresh_interval_minutes: REFRESH_INTERVAL_MINUTES,
   });
 });
 
-// Health check
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, time: Date.now() });
+  res.json({ ok: true, time: Date.now(), version: 'v2' });
 });
 
-/**
- * POST /api/upload
- * Body (multipart/form-data): video (file), caption, hashtags, uid
- */
-app.post('/api/upload', upload.single('video'), async (req, res) => {
+// *** CHANGE 3: wrapper catches multer errors and returns CORS-safe JSON ***
+app.post('/api/upload', (req, res, next) => {
+  upload.single('video')(req, res, (err) => {
+    if (err) {
+      console.error('Multer error:', err.message);
+      res.header('Access-Control-Allow-Origin', '*');
+      return res.status(400).json({ success: false, error: err.message });
+    }
+    next();
+  });
+}, async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+
   try {
     const { caption = '', hashtags = '', uid = null } = req.body;
-    const videoFile = req.file;
+    const file = req.file;
 
-    if (!videoFile) {
-      return res.status(400).json({ success: false, error: 'No video file provided' });
-    }
-    if (!uid) {
-      return res.status(400).json({ success: false, error: 'User ID (uid) is required' });
-    }
+    if (!file) return res.status(400).json({ success: false, error: 'No file provided' });
+    if (!uid) return res.status(400).json({ success: false, error: 'User ID (uid) is required' });
 
-    const telegramResult = await uploadToTelegram(videoFile.buffer, caption);
+    const isImage = file.mimetype.startsWith('image/');
+
+    console.log(`📤 Upload: uid=${uid}, type=${isImage ? 'image' : 'video'}, size=${(file.size / 1024 / 1024).toFixed(2)}MB`);
+
+    const telegramResult = await uploadToTelegram(file.buffer, caption, isImage, file.originalname);
 
     const postData = {
       uid,
-      type: 'video',
+      type: isImage ? 'image' : 'video',
       caption,
       hashtags: hashtags || '',
       video_url: telegramResult.video_url,
@@ -275,29 +285,24 @@ app.post('/api/upload', upload.single('video'), async (req, res) => {
     };
 
     const postId = await storePostInFirebase(uid, postData);
+    console.log(`✅ Post created: usersdata/${uid}/posts/${postId}`);
 
     res.json({
       success: true,
       post_id: postId,
       video_url: telegramResult.video_url,
-      message: 'Video uploaded and post created.',
+      type: isImage ? 'image' : 'video',
+      message: 'Upload succeeded and post created.',
     });
   } catch (error) {
-    console.error('Upload error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Internal server error',
-    });
+    console.error('Upload error:', error.message);
+    res.status(500).json({ success: false, error: error.message || 'Internal server error' });
   }
 });
 
-/**
- * POST /api/cron/refresh
- * Manually trigger the Telegram URL refresh job.
- * Protect with header: x-cron-secret: <CRON_SECRET>
- * (If CRON_SECRET is unset, the endpoint is open — use only in dev.)
- */
+// CRON REFRESH
 app.post('/api/cron/refresh', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
   if (CRON_SECRET) {
     const provided = req.headers['x-cron-secret'] || req.query.secret;
     if (provided !== CRON_SECRET) {
@@ -313,12 +318,9 @@ app.post('/api/cron/refresh', async (req, res) => {
   }
 });
 
-/**
- * GET /api/refresh-post/:uid/:postId
- * Refresh a single post's Telegram URL. Useful when a video fails to play.
- * Public — safe because it only re-signs an existing Telegram file.
- */
+// SINGLE POST REFRESH
 app.get('/api/refresh-post/:uid/:postId', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
   try {
     const { uid, postId } = req.params;
     const fresh = await refreshPostUrl(uid, postId);
@@ -330,35 +332,49 @@ app.get('/api/refresh-post/:uid/:postId', async (req, res) => {
   }
 });
 
-// 404 fallback
+// CORS preflight
+app.options('*', (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, x-cron-secret');
+  res.sendStatus(204);
+});
+
+// *** CHANGE 4: global error handler with CORS headers ***
+app.use((err, req, res, next) => {
+  console.error('Global error handler:', err.message);
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  if (err instanceof multer.MulterError) {
+    return res.status(400).json({ success: false, error: 'Upload error: ' + err.message });
+  }
+  res.status(500).json({ success: false, error: err.message || 'Server error' });
+});
+
+// 404
 app.use((req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
   res.status(404).json({ error: 'Route not found' });
 });
 
 // ============================================================
-// 9. START SERVER + SCHEDULE REFRESH
+// 9. START SERVER
 // ============================================================
 app.listen(PORT, () => {
-  console.log(`🚀 ConneX backend running on port ${PORT}`);
+  console.log(`🚀 ConneX backend v2 running on port ${PORT}`);
+  console.log(`   Accepts: video + image`);
+  console.log(`   Refresh interval: ${REFRESH_INTERVAL_MINUTES} min`);
 
-  // Internal scheduler — fires every REFRESH_INTERVAL_MINUTES.
-  // NOTE: On Render's free tier the instance sleeps when idle, so
-  // setInterval may not fire reliably. Use an external cron hitting
-  // /api/cron/refresh for guaranteed timing (see notes below).
   const intervalMs = REFRESH_INTERVAL_MINUTES * 60 * 1000;
   setInterval(() => {
-    refreshAllTelegramUrls().catch((e) =>
-      console.error('Scheduled refresh failed:', e)
-    );
+    refreshAllTelegramUrls().catch((e) => console.error('Scheduled refresh failed:', e));
   }, intervalMs);
 
-  // Also run one refresh shortly after boot (5s delay)
   setTimeout(() => {
     refreshAllTelegramUrls().catch(() => {});
   }, 5000);
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('SIGTERM received, shutting down.');
   process.exit(0);
